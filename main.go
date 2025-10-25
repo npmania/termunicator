@@ -62,7 +62,8 @@ type model struct {
 	users         map[string]*comm.User // cache users by ID
 	currentTeam   int                   // current active team
 	current       int                   // current active channel
-	selected      int                   // selected channel in sidebar
+	selected      int                   // selected item index (in its array)
+	selectedType  navItemType           // type of selected item
 	focus         focusArea             // which window has focus
 	scrollOffset  int                   // scroll position in message list (0 = bottom)
 	input         string
@@ -100,7 +101,8 @@ func initialModel(cfg config) model {
 		config:        cfg,
 		focus:         focusSidebar, // Start with sidebar focused for team selection
 		current:       -1,            // No channel selected initially
-		selected:      -1,            // No channel selected initially
+		selected:      0,             // Start at first item
+		selectedType:  navTeam,       // Start on teams
 		cursorVisible: true,          // Start with cursor visible
 	}
 }
@@ -290,7 +292,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case " ":
 			if m.focus == focusSidebar {
-				if !m.teamSelected {
+				if m.selectedType == navTeam {
 					// Select team with space key
 					if m.selected >= 0 && m.selected < len(m.teams) {
 						m.currentTeam = m.selected
@@ -311,14 +313,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 						m.channels = channels
 						m.current = -1
-						m.selected = -1
-						// Stay in sidebar to select channel - don't auto-focus
-						// Debug: Log channel count
+						// Move cursor to first channel if available
+						items := m.getNavItems()
+						for _, item := range items {
+							if item.itemType == navChannel || item.itemType == navDM {
+								m.selected = item.index
+								m.selectedType = item.itemType
+								break
+							}
+						}
 						if len(channels) == 0 {
 							m.err = fmt.Errorf("Warning: GetChannels returned 0 channels for team %s (%s)", m.teams[m.currentTeam].DisplayName, m.teams[m.currentTeam].ID)
 						}
 					}
-				} else {
+				} else if m.selectedType == navChannel || m.selectedType == navDM {
 					// Select channel/DM with space key
 					if m.selected >= 0 && m.selected < len(m.channels) {
 						m.current = m.selected
@@ -461,8 +469,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				if !exists {
+					// If at bottom, stay at bottom to show new message
+					wasAtBottom := m.scrollOffset == 0
 					m.messages = append(m.messages, newMsg)
-					m.scrollOffset = m.clampScrollOffset(m.scrollOffset)
+					if wasAtBottom {
+						m.scrollOffset = 0
+					} else {
+						m.scrollOffset = m.clampScrollOffset(m.scrollOffset)
+					}
 				}
 			}
 		}
@@ -622,37 +636,19 @@ func (m *model) getNavItems() []navItem {
 // getCurrentNavPosition returns the current position in the nav list
 func (m *model) getCurrentNavPosition() int {
 	items := m.getNavItems()
-
-	// Find current position based on teamSelected and selected index
-	if !m.teamSelected {
-		// In teams section
-		for i, item := range items {
-			if item.itemType == navTeam && item.index == m.selected {
-				return i
-			}
-		}
-	} else {
-		// In channels/DMs section
-		for i, item := range items {
-			if (item.itemType == navChannel || item.itemType == navDM) && item.index == m.selected {
-				return i
-			}
+	// Find item matching both type and index
+	for i, item := range items {
+		if item.itemType == m.selectedType && item.index == m.selected {
+			return i
 		}
 	}
-
 	// Default to first item
 	return 0
 }
 
 // isItemSelected checks if an item is the currently selected one
 func (m *model) isItemSelected(itemType navItemType, index int) bool {
-	items := m.getNavItems()
-	currentPos := m.getCurrentNavPosition()
-	if currentPos >= 0 && currentPos < len(items) {
-		item := items[currentPos]
-		return item.itemType == itemType && item.index == index
-	}
-	return false
+	return m.selectedType == itemType && m.selected == index
 }
 
 // navigateSidebar moves cursor up/down in sidebar with wrap-around
@@ -666,7 +662,9 @@ func (m *model) navigateSidebar(delta int) {
 	if newPos < 0 {
 		newPos += len(items)
 	}
-	m.selected = items[newPos].index
+	newItem := items[newPos]
+	m.selected = newItem.index
+	m.selectedType = newItem.itemType
 }
 
 // nick returns username for display
@@ -931,22 +929,17 @@ func (m model) View() string {
 
 	var b strings.Builder
 	for i := 0; i < height; i++ {
-		// Left side
-		// Note: We already padded text before styling, so don't pad again
-		// as that would break ANSI codes
+		// Left side - always pad to exact sidebarWidth
 		if i < len(leftLines) {
 			line := leftLines[i]
-			// Check if line has ANSI codes (styled)
-			if strings.Contains(line, "\x1b[") {
-				// Already padded before styling, use as-is
+			visibleLen := lipgloss.Width(line)
+			if visibleLen < sidebarWidth {
 				b.WriteString(line)
+				b.WriteString(strings.Repeat(" ", sidebarWidth-visibleLen))
+			} else if visibleLen > sidebarWidth {
+				// Truncate if too long
+				b.WriteString(line[:sidebarWidth])
 			} else {
-				// No styling, apply normal padding
-				if len(line) < sidebarWidth {
-					line += strings.Repeat(" ", sidebarWidth-len(line))
-				} else if len(line) > sidebarWidth {
-					line = line[:sidebarWidth]
-				}
 				b.WriteString(line)
 			}
 		} else {
@@ -959,9 +952,7 @@ func (m model) View() string {
 		var msgLine string
 		if i == height-1 {
 			// Always render input at bottom (last line)
-			// Replace newlines with visible marker for display
 			displayInput := strings.ReplaceAll(m.input, "\n", "↵")
-			// Add cursor - blink when focused on main
 			runes := []rune(displayInput)
 			var inputWithCursor string
 			cursorChar := " "
@@ -970,7 +961,6 @@ func (m model) View() string {
 			} else if m.focus == focusMain {
 				cursorChar = " "
 			} else {
-				// Not focused, show static cursor
 				cursorChar = "█"
 			}
 			if m.cursorPos >= len(runes) {
@@ -984,43 +974,21 @@ func (m model) View() string {
 			}
 			msgLine = inputStyle.Render(inputLine)
 		} else if i < len(rightLines) {
-			// Show messages from rightLines
 			msgLine = rightLines[i]
 		} else {
-			// Empty line
 			msgLine = ""
 		}
 
-		// Pad message line to mainWidth (accounting for ANSI codes if styled)
-		// For simplicity, render as-is and pad with spaces
+		// Pad message line to exact mainWidth using lipgloss.Width
 		b.WriteString(msgLine)
-
-		// Calculate visible width (rough - lipgloss may add ANSI codes)
-		// For now, pad to ensure proper alignment
-		visibleLen := len(msgLine)
-		// Strip ANSI codes for length calculation (simple approach)
-		if strings.Contains(msgLine, "\x1b[") {
-			// Has ANSI codes, approximate visible length
-			visibleLen = 0
-			inEscape := false
-			for _, ch := range msgLine {
-				if ch == '\x1b' {
-					inEscape = true
-				} else if inEscape && ch == 'm' {
-					inEscape = false
-				} else if !inEscape {
-					visibleLen++
-				}
-			}
-		}
-
+		visibleLen := lipgloss.Width(msgLine)
 		if visibleLen < mainWidth {
 			b.WriteString(strings.Repeat(" ", mainWidth-visibleLen))
 		}
 
-		// Add scrollbar at far right
+		// Add scrollbar at far right - always 1 char
 		if i == height-1 {
-			b.WriteString(" ") // No scrollbar on input line
+			b.WriteString(" ")
 		} else {
 			b.WriteString(scrollbarChar(i, msgHeight, m.scrollOffset, len(m.messages)))
 		}
