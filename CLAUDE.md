@@ -2,85 +2,106 @@
 
 ## Overview
 
-termunicator is a Terminal User Interface (TUI) application for the Communicator project. It provides a rich, interactive command-line interface for accessing multiple chat platforms.
+termunicator is a Terminal User Interface (TUI) application for the Communicator project. It provides a simple, irssi-style command-line interface for accessing multiple chat platforms.
 
 ## Architecture
 
 ### Core Design
-- Written in Go for excellent terminal handling and cross-platform support
+- Written in Go following Russ Cox and Rob Pike programming principles
+- Simple, clear code with small interfaces
 - Uses libcommunicator (via cgo) for all platform communication
-- Keyboard-driven interface with vim-style keybindings
-- Multi-pane layout for channels, messages, and user lists
+- Keyboard-driven interface inspired by irssi IRC client
+- Minimalist single-pane layout: status bar, messages, input
 
 ### Technology Stack
-- Go programming language
-- TUI library (bubbletea/tview/termui - to be determined)
+- Go programming language (following Pike/Cox best practices)
+- bubbletea for TUI framework
+- lipgloss for minimal styling (basic terminal colors)
 - cgo for interfacing with libcommunicator
 
 ## Project Structure
 
 ```
 termunicator/
-├── claude.md              # This file
-├── go.mod                 # Go module definition
-├── go.sum                 # Go dependencies
-├── main.go                # Application entry point
-├── cmd/                   # Command-line interface
-├── internal/
-│   ├── ui/               # TUI components
-│   │   ├── layout.go     # Main layout management
-│   │   ├── channels.go   # Channel list pane
-│   │   ├── messages.go   # Message display pane
-│   │   ├── input.go      # Message input pane
-│   │   └── users.go      # User list pane
-│   ├── lib/              # libcommunicator bindings
-│   │   └── communicator.go # cgo wrapper
-│   ├── state/            # Application state management
-│   └── config/           # Configuration handling
-└── assets/               # Static resources
+├── CLAUDE.md             # This file - project documentation
+├── go.mod                # Go module definition
+├── go.sum                # Go dependencies
+├── main.go               # Main application (simple, single file)
+└── internal/
+    ├── lib/              # libcommunicator bindings (legacy)
+    │   └── communicator.go
+    ├── ui/               # Legacy UI code
+    └── config/           # Legacy config code
 ```
+
+Note: Following Pike/Cox principles, the main application is kept simple in a single
+main.go file. The internal packages are legacy code from earlier iterations.
 
 ## Key Features
 
-### UI Components
-- **Channel List**: Browse and switch between channels/conversations
-- **Message View**: Display messages with timestamps, authors, reactions
-- **Input Field**: Compose and send messages
-- **User List**: View online/offline status of users
-- **Status Bar**: Connection status, notifications, keybinding hints
+### UI Layout (irssi-style)
+- **Status Bar**: Time, current channel, activity indicators
+- **Message Area**: Simple format `HH:MM <nick> message`
+- **Input Line**: Channel prefix with input text
+
+All in a single, focused view - no multiple panes or complex layouts.
 
 ### Functionality
 - Multi-platform support through libcommunicator
 - Real-time message updates
-- Message composition with multi-line support
-- Keyboard shortcuts for navigation
-- Search functionality for messages and channels
-- Thread support for conversations
-- Notification handling
+- Simple message composition
+- Channel switching (irssi-style)
 
-## Keybindings (Planned)
+## Keybindings
 
 ```
-General:
-  Ctrl+C / q    - Quit
-  Ctrl+P        - Switch platform/workspace
-  /             - Search
-  ?             - Help
+Messaging:
+  Enter            - Send message
+  Backspace        - Delete character
+  (any char)       - Type message
 
 Navigation:
-  Tab / Shift+Tab  - Cycle through panes
-  j / k            - Move up/down in lists
-  Enter            - Select/open item
-  Esc              - Cancel/back
+  PgUp/PgDown      - Previous/next channel
+  Alt+1 to Alt+9   - Jump to channel 1-9
 
-Messaging:
-  i                - Enter insert mode (compose message)
-  Esc              - Exit insert mode
-  Enter            - Send message (in insert mode)
-  Shift+Enter      - New line (in insert mode)
+General:
+  Ctrl+C           - Quit
 ```
 
 ## Configuration
+
+### Environment Variables
+
+termunicator supports two authentication methods:
+
+#### Option 1: Token Authentication (Recommended)
+```bash
+export MATTERMOST_HOST=chat.mysite.io
+export MATTERMOST_TOKEN=your_personal_access_token_here
+export MATTERMOST_TEAM_ID=your_team_id_here  # Optional
+```
+
+**Creating a Personal Access Token:**
+
+1. Log into your Mattermost instance in your browser
+2. Go to **Account Settings** (click your profile picture → Account Settings)
+3. Navigate to **Security** → **Personal Access Tokens**
+4. Click **Create Token**
+5. Give it a description (e.g., "termunicator CLI")
+6. Copy the token immediately (you won't be able to see it again!)
+7. Set it as `MATTERMOST_TOKEN` environment variable
+
+Personal Access Tokens do NOT expire your browser session and are designed for API/CLI access.
+
+#### Option 2: Password Authentication
+```bash
+export MATTERMOST_HOST=chat.mysite.io
+export MATTERMOST_LOGIN_ID=your_email@example.com  # or username
+export MATTERMOST_PASSWORD=your_password
+export MATTERMOST_TEAM_ID=your_team_id_here  # Optional
+```
+
+**Note:** Password login creates a new session each time, which may affect browser sessions.
 
 Configuration file locations:
 - Linux: `~/.config/termunicator/config.yaml`
@@ -109,10 +130,11 @@ go run main.go
 ## Dependencies
 
 Key Go packages:
-- TUI framework (to be selected)
+- bubbletea - TUI framework
+- lipgloss - Terminal styling
 - cgo for libcommunicator integration
-- Configuration library (viper/koanf)
-- Logging library (zerolog/zap)
+
+Following Pike/Cox principles: minimal dependencies, use standard library where possible.
 
 ## Integration with libcommunicator
 
