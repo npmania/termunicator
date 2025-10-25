@@ -1,14 +1,13 @@
 # termunicator
 
-A Plan 9 acme-inspired Terminal User Interface (TUI) for Mattermost.
+Terminal User Interface (TUI) for Mattermost.
 
 ## Features
 
-- 🎨 Plan 9 acme-style interface with clean separators
 - 💬 Channel and Direct Message support
-- ⚡ Real-time username resolution with caching
-- 📏 Automatic window resizing
-- ⌨️ Vim-inspired keyboard navigation
+- ⚡ Real-time message updates via WebSocket
+- 🎯 Simple, focused single-pane layout
+- ⌨️ Keyboard-driven navigation
 
 ## Prerequisites
 
@@ -95,35 +94,44 @@ LD_LIBRARY_PATH=../libcommunicator/target/release ./termunicator -host chat.exam
 
 ## Keyboard Controls
 
-- `↑` / `↓` - Navigate between channels/DMs
+### Sidebar Navigation
+- `↑` / `↓` - Navigate teams/channels/DMs (wrap-around)
+- `Space` - Select team or channel/DM
+- `Ctrl+B` - Toggle between sidebar and message area
+
+### Message Area
+- `↑` / `↓` - Scroll messages one line
+- `PgUp` / `PgDown` - Scroll messages by page
 - `Enter` - Send message
 - Type - Compose message
 - `Backspace` - Delete character
-- `q` / `Ctrl+C` - Quit
+
+### General
+- `Ctrl+C` - Quit
 
 ## UI Layout
 
 ```
-┌─────────────────────────────────────────┐
-│ termunicator | Del Snarf | Look         │  ← acme-style title bar
-├─────────────────────────────────────────┤
-│ Channels                                 │  ← Channel list
-│  ▸ general                              │
-│    random                                │
-├─────────────────────────────────────────┤
-│ Direct Messages                          │  ← DM list
-│    alice                                 │
-├─────────────────────────────────────────┤
-│ #general                                 │  ← Active channel
-├─────────────────────────────────────────┤
-│ bob: hello everyone                      │  ← Messages
-│ alice: hi there!                         │
-├─────────────────────────────────────────┤
-│ type your message here...                │  ← Input
-├─────────────────────────────────────────┤
-│ Enter: send | ↑/↓: switch | q: quit     │  ← Status/help
-└─────────────────────────────────────────┘
+┌────────────┬─────────────────────────────┬─┐
+│ [Teams]    │ 10:23 @alice: Hello!        │█│
+│ *MyTeam    │ 10:24 @bob: Hi there        │ │
+│  OtherTeam │ 10:25 @carol: How are you?  │ │
+│            │                              │ │
+│ [Channels] │                              │ │
+│ >1:general │                              │ │
+│  2:random  │                              │ │
+│            │                              │ │
+│ [DMs]      │                              │ │
+│  alice     │                              │ │
+│            │                              │ │
+│            │                              │ │
+│            │ #general> type here_         │ │
+└────────────┴─────────────────────────────┴─┘
 ```
+
+Legend:
+- `*` - Cursor position (before selection)
+- `>` - Active team/channel/DM
 
 ## Troubleshooting
 
