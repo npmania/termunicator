@@ -51,6 +51,11 @@ All in a single, focused view - no multiple panes or complex layouts.
 - Real-time message updates
 - Simple message composition
 - Channel switching (irssi-style)
+- Thread filtering: Shows only root posts (first post of each thread) in both channels and DMs
+- Message cursor: Navigate through messages with arrow keys, selected message highlighted with cyan background (black text on cyan)
+- Multi-line message support: Messages with newlines display properly with indentation on continuation lines
+- Smart text fitting: Long lines are truncated to fit within the post area width (no horizontal terminal scrolling)
+- Smart message fitting: Displays as many complete messages as possible in available screen space
 
 ## Keybindings
 
@@ -61,8 +66,13 @@ Messaging:
   (any char)       - Type message
 
 Navigation:
-  PgUp/PgDown      - Previous/next channel
-  Alt+1 to Alt+9   - Jump to channel 1-9
+  Up/Down          - Move cursor through messages
+  PgUp/PgDown      - Scroll by page
+  Ctrl+B           - Switch focus (sidebar/main)
+
+  Sidebar:
+    Up/Down        - Navigate channels
+    Space          - Select channel
 
 General:
   Ctrl+C           - Quit

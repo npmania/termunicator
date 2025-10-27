@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -14,16 +15,64 @@ import (
 	comm "libcommunicator"
 )
 
-// irssi-style colors - simple terminal colors
-var (
-	statusStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("4"))                         // white on blue
-	nickStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))                                                         // green
-	timeStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))                                                          // gray
-	inputStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))                                                         // white
-	activityStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))                                                         // yellow
-	currentStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)                                              // yellow bold for current
-	selectedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)                                              // cyan bold for selected
+// Constants - Pike/Cox: named constants instead of magic numbers
+const (
+	// Message fetching
+	messageFetchLimit     = 50
+	messagePageJumpMin    = 5
+	messagePageJumpDiv    = 2
+	messagePrefetchBuffer = 3 // Fetch older when within this many messages of top
+
+	// UI dimensions
+	defaultWidth        = 80
+	defaultHeight       = 24
+	sidebarWidth        = 20
+	sidebarWidthSmall   = 15
+	minMainWidth        = 20
+	minMessageHeight    = 3
+	maxChannelsDisplay  = 9
+	maxDMsDisplay       = 5
+	minWidthForFullSide = 50
+
+	// Input and formatting
+	timeWidth           = 5 // "HH:MM"
+	nickPrefixLen       = 1 // "<"
+	nickSuffixLen       = 2 // "> "
+	ellipsisLen         = 3
+	minTruncateWidth    = 3
+	userIDTruncateLen   = 8
+	printableCharMin    = 32
+	printableCharMax    = 126
+
+	// Timing
+	cursorBlinkInterval      = 500 * time.Millisecond
+	eventStreamBufferSize    = 100
+	eventStreamDebounceDelay = 100 * time.Millisecond
 )
+
+// Pike/Cox: group related globals into a struct for clarity
+type styles struct {
+	status      lipgloss.Style
+	nick        lipgloss.Style
+	time        lipgloss.Style
+	input       lipgloss.Style
+	activity    lipgloss.Style
+	current     lipgloss.Style
+	selected    lipgloss.Style
+	highlighted lipgloss.Style
+}
+
+// irssi-style colors - simple terminal colors
+var style = styles{
+	status:      lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("4")), // white on blue
+	nick:        lipgloss.NewStyle().Foreground(lipgloss.Color("10")),                                 // green
+	time:        lipgloss.NewStyle().Foreground(lipgloss.Color("8")),                                  // gray
+	input:       lipgloss.NewStyle().Foreground(lipgloss.Color("15")),                                 // white
+	activity:    lipgloss.NewStyle().Foreground(lipgloss.Color("11")),                                 // yellow
+	current:     lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true),                      // yellow bold for current
+	selected:    lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true),                      // cyan bold for selected
+	highlighted: lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("14")), // black on cyan for highlighted message
+}
 
 type config struct {
 	host     string
@@ -66,10 +115,11 @@ type model struct {
 	selectedType  navItemType           // type of selected item
 	focus         focusArea             // which window has focus
 	scrollOffset  int                   // scroll position in message list (0 = bottom)
+	messageCursor int                   // selected message index in display messages (-1 = none)
 	input         string
-	cursorPos     int                   // cursor position in input
-	teamSelected  bool                  // whether a team has been selected
-	cursorVisible bool                  // for blinking cursor
+	cursorPos     int  // cursor position in input
+	teamSelected  bool // whether a team has been selected
+	cursorVisible bool // for blinking cursor
 	err           error
 	connected     bool
 	ctx           context.Context
@@ -77,6 +127,11 @@ type model struct {
 	width         int
 	height        int
 	config        config
+	// Performance caches (Pike/Cox: avoid repeated allocations)
+	displayMsgsCache []comm.Message // cached filtered messages
+	displayMsgsDirty bool           // true when messages changed
+	navItemsCache    []navItem      // cached nav items
+	navItemsDirty    bool           // true when teams/channels changed
 }
 
 type messagesMsg []comm.Message
@@ -95,15 +150,20 @@ type tickMsg time.Time
 func initialModel(cfg config) model {
 	ctx, cancel := context.WithCancel(context.Background())
 	return model{
-		ctx:           ctx,
-		cancel:        cancel,
-		users:         make(map[string]*comm.User),
-		config:        cfg,
-		focus:         focusSidebar, // Start with sidebar focused for team selection
-		current:       -1,            // No channel selected initially
-		selected:      0,             // Start at first item
-		selectedType:  navTeam,       // Start on teams
-		cursorVisible: true,          // Start with cursor visible
+		ctx:              ctx,
+		cancel:           cancel,
+		users:            make(map[string]*comm.User),
+		config:           cfg,
+		focus:            focusSidebar, // Start with sidebar focused for team selection
+		current:          -1,            // No channel selected initially
+		selected:         0,             // Start at first item
+		selectedType:     navTeam,       // Start on teams
+		messageCursor:    -1,            // No message selected initially
+		cursorVisible:    true,               // Start with cursor visible
+		width:            defaultWidth,       // Default width
+		height:           defaultHeight,      // Default height
+		displayMsgsDirty: true,          // Force initial cache build
+		navItemsDirty:    true,          // Force initial cache build
 	}
 }
 
@@ -113,7 +173,7 @@ func (m model) Init() tea.Cmd {
 
 // tickCmd returns a command that sends a tick message for cursor blinking
 func tickCmd() tea.Cmd {
-	return tea.Tick(time.Millisecond*500, func(t time.Time) tea.Msg {
+	return tea.Tick(cursorBlinkInterval, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
@@ -199,7 +259,7 @@ func (m model) connectToMattermost() tea.Msg {
 
 	// Create event stream for real-time updates
 	ctx := context.Background()
-	eventStream, err := platform.NewEventStream(ctx, 100, 100*time.Millisecond)
+	eventStream, err := platform.NewEventStream(ctx, eventStreamBufferSize, eventStreamDebounceDelay)
 	if err != nil {
 		return errMsg(fmt.Errorf("create event stream failed: %w", err))
 	}
@@ -215,177 +275,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c":
-			m.cancel()
-			if m.eventStream != nil {
-				m.eventStream.Close()
-			}
-			if m.platform != nil {
-				m.platform.Disconnect()
-				m.platform.Destroy()
-			}
-			comm.Cleanup()
-			return m, tea.Quit
+		key := msg.String()
 
-		case "ctrl+b":
-			// Toggle focus between sidebar and main
-			if m.focus == focusSidebar {
-				m.focus = focusMain
-			} else {
-				m.focus = focusSidebar
-			}
-			return m, nil
+		// Try global keys first (ctrl+c, ctrl+b)
+		if newModel, cmd, handled := m.handleGlobalKeys(key); handled {
+			return newModel, cmd
+		}
 
-		case "enter":
-			if m.focus == focusMain {
-				// Send message
-				if m.input == "" || !m.connected || len(m.channels) == 0 || m.current < 0 {
-					return m, nil
-				}
-				channelID := m.channels[m.current].ID
-				if _, err := m.platform.SendMessage(channelID, m.input); err != nil {
-					m.err = err
-				}
-				m.input = ""
-				m.cursorPos = 0
-				return m, fetchMessages(m.platform, channelID)
-			}
-			return m, nil
+		// Try sidebar-specific keys
+		if newModel, cmd, handled := m.handleSidebarKeys(key); handled {
+			return newModel, cmd
+		}
 
-		case "up":
-			if m.focus == focusSidebar {
-				m.navigateSidebar(-1)
-			} else if m.focus == focusMain {
-				m.scrollOffset = m.clampScrollOffset(m.scrollOffset + 1)
-			}
-			return m, nil
+		// Try main area keys
+		if newModel, cmd, handled := m.handleMainKeys(key); handled {
+			return newModel, cmd
+		}
 
-		case "down":
-			if m.focus == focusSidebar {
-				m.navigateSidebar(1)
-			} else if m.focus == focusMain {
-				m.scrollOffset = m.clampScrollOffset(m.scrollOffset - 1)
-			}
-			return m, nil
-
-
-		case "pgup":
-			if m.focus == focusMain {
-				// Page up - scroll by full page
-				oldOffset := m.scrollOffset
-				m.scrollOffset = m.clampScrollOffset(m.scrollOffset + m.msgHeight())
-				// At the top, try to fetch older messages
-				if m.scrollOffset == m.maxScroll() && m.scrollOffset == oldOffset && len(m.messages) > 0 && m.current >= 0 && m.current < len(m.channels) {
-					oldestMsg := m.messages[0]
-					return m, fetchOlderMessages(m.platform, m.channels[m.current].ID, oldestMsg.ID)
-				}
-			}
-			return m, nil
-
-		case "pgdown":
-			if m.focus == focusMain {
-				// Page down - scroll by full page
-				m.scrollOffset = m.clampScrollOffset(m.scrollOffset - m.msgHeight())
-			}
-			return m, nil
-
-		case " ":
-			if m.focus == focusSidebar {
-				if m.selectedType == navTeam {
-					// Select team with space key
-					if m.selected >= 0 && m.selected < len(m.teams) {
-						m.currentTeam = m.selected
-						m.teamSelected = true
-						// Clear messages and input
-						m.messages = nil
-						m.input = ""
-						m.cursorPos = 0
-						// Set team ID in platform and refresh channels
-						if err := m.platform.SetTeamID(m.teams[m.currentTeam].ID); err != nil {
-							m.err = fmt.Errorf("SetTeamID error: %w", err)
-							return m, nil
-						}
-						channels, err := m.platform.GetChannels()
-						if err != nil {
-							m.err = fmt.Errorf("GetChannels error: %w", err)
-							return m, nil
-						}
-						m.channels = channels
-						m.current = -1
-						// Move cursor to first channel if available
-						items := m.getNavItems()
-						for _, item := range items {
-							if item.itemType == navChannel || item.itemType == navDM {
-								m.selected = item.index
-								m.selectedType = item.itemType
-								break
-							}
-						}
-						if len(channels) == 0 {
-							m.err = fmt.Errorf("Warning: GetChannels returned 0 channels for team %s (%s)", m.teams[m.currentTeam].DisplayName, m.teams[m.currentTeam].ID)
-						}
-					}
-				} else if m.selectedType == navChannel || m.selectedType == navDM {
-					// Select channel/DM with space key
-					if m.selected >= 0 && m.selected < len(m.channels) {
-						m.current = m.selected
-						m.scrollOffset = 0 // Reset scroll
-						// Clear messages and input when switching channel
-						m.messages = nil
-						m.input = ""
-						m.cursorPos = 0
-						// Switch focus to main area
-						m.focus = focusMain
-						return m, fetchMessages(m.platform, m.channels[m.current].ID)
-					}
-				}
-			} else {
-				// In main area, space is part of input
-				m.input += " "
-				m.cursorPos++
-			}
-			return m, nil
-
-		case "backspace", "ctrl+h":
-			// Backspace removes character in typing section
-			// Some terminals send "backspace", others send "ctrl+h"
-			if len(m.input) > 0 && m.cursorPos > 0 {
-				// Handle UTF-8 correctly by converting to runes
-				runes := []rune(m.input)
-				if m.cursorPos <= len(runes) {
-					m.input = string(runes[:m.cursorPos-1]) + string(runes[m.cursorPos:])
-					m.cursorPos--
-				}
-			}
-			return m, nil
-
-		case "ctrl+enter", "ctrl+m":
-			// Ctrl+Enter adds newline in typing section
-			if m.focus == focusMain {
-				runes := []rune(m.input)
-				m.input = string(runes[:m.cursorPos]) + "\n" + string(runes[m.cursorPos:])
-				m.cursorPos++
-			}
-			return m, nil
-
-		default:
-			// Only accept printable input when main area is focused
-			if m.focus == focusMain {
-				str := msg.String()
-
-				// Ignore other ctrl and alt combinations (but not the ones above)
-				if strings.HasPrefix(str, "ctrl+") || strings.HasPrefix(str, "alt+") {
-					return m, nil
-				}
-
-				// Only add single printable characters
-				if len(str) == 1 && str[0] >= 32 && str[0] <= 126 {
-					runes := []rune(m.input)
-					m.input = string(runes[:m.cursorPos]) + str + string(runes[m.cursorPos:])
-					m.cursorPos++
-				}
-			}
+		// Try regular character input
+		if newModel, cmd, handled := m.handleInputChar(key); handled {
+			return newModel, cmd
 		}
 
 	case connectedMsg:
@@ -394,6 +303,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.teams = msg.teams
 		m.channels = msg.channels
 		m.connected = true
+		m.navItemsDirty = true // Invalidate nav cache
 		// If teamID was provided via config, position cursor on that team
 		if m.config.teamID != "" {
 			for i, team := range m.teams {
@@ -472,6 +382,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// If at bottom, stay at bottom to show new message
 					wasAtBottom := m.scrollOffset == 0
 					m.messages = append(m.messages, newMsg)
+					m.displayMsgsDirty = true // Invalidate cache
 					if wasAtBottom {
 						m.scrollOffset = 0
 					} else {
@@ -482,19 +393,131 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case messagesMsg:
+		log.Printf("messagesMsg: received %d messages for channel", len(msg))
+
+		// Count how many are displayable (root posts only)
+		displayCount := 0
+		threadReplyCount := 0
+		for _, newMsg := range msg {
+			if isThreadReply(newMsg) {
+				threadReplyCount++
+			} else {
+				displayCount++
+			}
+		}
+		log.Printf("messagesMsg: %d root posts, %d thread replies", displayCount, threadReplyCount)
+
 		m.messages = msg
-		m.scrollOffset = 0 // Reset scroll to bottom (newest messages) when loading new channel
+		m.displayMsgsDirty = true // Invalidate cache
+		m.scrollOffset = 0        // Reset scroll to bottom (newest messages) when loading new channel
+		m.messageCursor = -1      // Reset cursor when messages are replaced
+
+		// If no root posts in initial load, fetch older messages
+		if displayCount == 0 && len(msg) > 0 && m.current >= 0 && m.current < len(m.channels) {
+			log.Printf("messagesMsg: no root posts in initial load, fetching older...")
+			oldestMsg := msg[0]
+			return m, fetchOlderMessages(m.platform, m.channels[m.current].ID, oldestMsg.ID)
+		} else if displayCount > 0 {
+			log.Printf("messagesMsg: showing %d root posts", displayCount)
+		} else {
+			log.Printf("messagesMsg: channel is empty")
+		}
 
 	case olderMessagesMsg:
-		// Prepend older messages to the beginning
+		// Prepend older messages to the beginning (with deduplication)
+		log.Printf("olderMessagesMsg: received %d messages from server", len(msg))
 		if len(msg) > 0 {
-			m.messages = append(msg, m.messages...)
-			// Adjust scroll to maintain viewing position
-			m.scrollOffset += len(msg)
-			// Clamp scroll position to valid range
-			m.scrollOffset = m.clampScrollOffset(m.scrollOffset)
+			// Log first and last message IDs for pagination tracking
+			if len(msg) > 0 {
+				log.Printf("olderMessagesMsg: first message ID=%s, last message ID=%s", msg[0].ID, msg[len(msg)-1].ID)
+			}
+
+			// Server returned messages - deduplicate them
+			newMessages := make([]comm.Message, 0, len(msg))
+			duplicateCount := 0
+			for _, fetchedMsg := range msg {
+				exists := false
+				for _, existingMsg := range m.messages {
+					if existingMsg.ID == fetchedMsg.ID {
+						exists = true
+						duplicateCount++
+						break
+					}
+				}
+				if !exists {
+					newMessages = append(newMessages, fetchedMsg)
+				}
+			}
+
+			log.Printf("olderMessagesMsg: %d new messages after dedup (%d duplicates)", len(newMessages), duplicateCount)
+
+			// Count how many of the new messages will be displayed (only root posts)
+			displayCount := 0
+			threadReplyCount := 0
+			for _, newMsg := range newMessages {
+				if isThreadReply(newMsg) {
+					threadReplyCount++
+					// Log details about thread replies
+					if newMsg.Metadata != nil {
+						if meta, ok := newMsg.Metadata.(map[string]interface{}); ok {
+							rootID, _ := meta["root_id"].(string)
+							log.Printf("  Thread reply: ID=%s, root_id=%s", newMsg.ID, rootID)
+						}
+					}
+				} else {
+					displayCount++
+					log.Printf("  Root post: ID=%s, text=%s", newMsg.ID, truncate(newMsg.Text, 50))
+				}
+			}
+
+			log.Printf("olderMessagesMsg: %d root posts, %d thread replies", displayCount, threadReplyCount)
+
+			// Add messages to storage (even if all duplicates, still track for pagination)
+			if len(newMessages) > 0 {
+				m.messages = append(newMessages, m.messages...)
+				m.displayMsgsDirty = true // Invalidate cache
+			}
+
+			// Decide what to do based on whether we got displayable root posts
+			if displayCount > 0 {
+				// Got root posts - show them
+				log.Printf("olderMessagesMsg: SUCCESS - showing %d root posts", displayCount)
+
+				if m.messageCursor >= 0 {
+					m.messageCursor += displayCount
+				}
+
+				// Show new messages at top, keep cursor visible
+				showCount := displayCount / 2
+				if showCount > m.msgHeight()/2 {
+					showCount = m.msgHeight() / 2
+				}
+				if showCount < 3 && displayCount >= 3 {
+					showCount = 3
+				}
+				m.scrollOffset += displayCount - showCount
+
+				// Ensure cursor stays visible after all adjustments
+				m.ensureCursorVisible()
+			} else {
+				// Server returned messages but no displayable root posts
+				// Only continue if we got NEW messages (not all duplicates)
+				if len(newMessages) > 0 && m.current >= 0 && m.current < len(m.channels) && len(m.messages) > 0 {
+					oldestMsg := m.messages[0]
+					log.Printf("olderMessagesMsg: no root posts found, continuing to fetch older (using oldest message ID=%s)", oldestMsg.ID)
+					return m, fetchOlderMessages(m.platform, m.channels[m.current].ID, oldestMsg.ID)
+				} else {
+					if len(newMessages) == 0 {
+						log.Printf("olderMessagesMsg: STOP - all messages were duplicates (pagination stuck)")
+					} else {
+						log.Printf("olderMessagesMsg: no root posts and cannot fetch more (no channel or no messages)")
+					}
+				}
+			}
+		} else {
+			// Server returned empty - stop trying
+			log.Printf("olderMessagesMsg: server returned EMPTY - no more messages available")
 		}
-		// If no messages returned, we've hit the end - stay at current position
 
 	case errMsg:
 		m.err = msg
@@ -512,22 +535,341 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// Pike/Cox: extract keyboard handlers from Update to reduce function size
+// handleGlobalKeys handles keys that work regardless of focus
+func (m model) handleGlobalKeys(key string) (tea.Model, tea.Cmd, bool) {
+	switch key {
+	case "ctrl+c":
+		m.cancel()
+		if m.eventStream != nil {
+			m.eventStream.Close()
+		}
+		if m.platform != nil {
+			m.platform.Disconnect()
+			m.platform.Destroy()
+		}
+		comm.Cleanup()
+		return m, tea.Quit, true
+
+	case "ctrl+b":
+		// Toggle focus between sidebar and main
+		if m.focus == focusSidebar {
+			m.focus = focusMain
+		} else {
+			m.focus = focusSidebar
+		}
+		return m, nil, true
+	}
+	return m, nil, false
+}
+
+// handleSidebarKeys handles keyboard input when sidebar is focused
+func (m model) handleSidebarKeys(key string) (tea.Model, tea.Cmd, bool) {
+	if m.focus != focusSidebar {
+		return m, nil, false
+	}
+
+	switch key {
+	case "up":
+		m.navigateSidebar(-1)
+		return m, nil, true
+
+	case "down":
+		m.navigateSidebar(1)
+		return m, nil, true
+
+	case " ":
+		if m.selectedType == navTeam {
+			// Select team with space key
+			if m.selected >= 0 && m.selected < len(m.teams) {
+				m.currentTeam = m.selected
+				m.teamSelected = true
+				// Clear messages and input
+				m.messages = nil
+				m.input = ""
+				m.cursorPos = 0
+				m.displayMsgsDirty = true // Invalidate message cache
+				m.navItemsDirty = true    // Invalidate nav cache (channels will change)
+				// Set team ID in platform and refresh channels
+				if err := m.platform.SetTeamID(m.teams[m.currentTeam].ID); err != nil {
+					m.err = fmt.Errorf("SetTeamID error: %w", err)
+					return m, nil, true
+				}
+				channels, err := m.platform.GetChannels()
+				if err != nil {
+					m.err = fmt.Errorf("GetChannels error: %w", err)
+					return m, nil, true
+				}
+				m.channels = channels
+				m.current = -1
+				// Move cursor to first channel if available
+				items := m.getNavItems()
+				for _, item := range items {
+					if item.itemType == navChannel || item.itemType == navDM {
+						m.selected = item.index
+						m.selectedType = item.itemType
+						break
+					}
+				}
+				if len(channels) == 0 {
+					m.err = fmt.Errorf("Warning: GetChannels returned 0 channels for team %s (%s)", m.teams[m.currentTeam].DisplayName, m.teams[m.currentTeam].ID)
+				}
+			}
+		} else if m.selectedType == navChannel || m.selectedType == navDM {
+			// Select channel/DM with space key
+			if m.selected >= 0 && m.selected < len(m.channels) {
+				m.current = m.selected
+				log.Printf("User selected channel: %s (ID=%s)", m.channels[m.current].DisplayName, m.channels[m.current].ID)
+				m.scrollOffset = 0       // Reset scroll
+				m.messageCursor = -1     // Reset message cursor
+				m.displayMsgsDirty = true // Invalidate message cache
+				// Clear messages and input when switching channel
+				m.messages = nil
+				m.input = ""
+				m.cursorPos = 0
+				// Switch focus to main area
+				m.focus = focusMain
+				return m, fetchMessages(m.platform, m.channels[m.current].ID), true
+			}
+		}
+		return m, nil, true
+	}
+	return m, nil, false
+}
+
+// handleMainKeys handles keyboard input when main area is focused
+func (m model) handleMainKeys(key string) (tea.Model, tea.Cmd, bool) {
+	if m.focus != focusMain {
+		return m, nil, false
+	}
+
+	switch key {
+	case "enter":
+		// Send message
+		if m.input == "" || !m.connected || len(m.channels) == 0 || m.current < 0 {
+			return m, nil, true
+		}
+		channelID := m.channels[m.current].ID
+		if _, err := m.platform.SendMessage(channelID, m.input); err != nil {
+			m.err = err
+		}
+		m.input = ""
+		m.cursorPos = 0
+		return m, fetchMessages(m.platform, channelID), true
+
+	case "up":
+		displayMsgs := m.getDisplayMessages()
+		if len(displayMsgs) == 0 {
+			return m, nil, true
+		}
+		if m.messageCursor == -1 {
+			// Start from the last visible message
+			totalMsgs := len(displayMsgs)
+			end := totalMsgs - m.scrollOffset
+			if end > 0 {
+				m.messageCursor = end - 1
+			}
+			// Ensure cursor is in valid range
+			if m.messageCursor < 0 {
+				m.messageCursor = 0
+			}
+			if m.messageCursor >= totalMsgs {
+				m.messageCursor = totalMsgs - 1
+			}
+		} else if m.messageCursor > 0 {
+			// Move to previous message
+			m.messageCursor--
+			// Auto-scroll to keep cursor visible
+			m.ensureCursorVisible()
+		} else if m.messageCursor == 0 {
+			// At first displayed message
+			// Only try to scroll up if we have loaded messages above
+			if m.scrollOffset < m.maxScroll() {
+				// Can scroll up to show older messages that are already loaded
+				m.scrollOffset = m.clampScrollOffset(m.scrollOffset + 1)
+			} else if m.scrollOffset >= m.maxScroll() && len(m.messages) > 0 && m.current >= 0 && m.current < len(m.channels) {
+				// At max scroll - try to fetch older messages from server
+				// Cursor stays at 0, will only move if server returns root posts
+				log.Printf("up arrow: fetching older messages (at top)")
+				oldestMsg := m.messages[0]
+				return m, fetchOlderMessages(m.platform, m.channels[m.current].ID, oldestMsg.ID), true
+			}
+			// If already at absolute top, do nothing (keep cursor at 0, visible)
+		}
+		return m, nil, true
+
+	case "down":
+		displayMsgs := m.getDisplayMessages()
+		if len(displayMsgs) == 0 {
+			return m, nil, true
+		}
+
+		if m.messageCursor == -1 {
+			// In input mode, down scrolls down if scrolled up
+			if m.scrollOffset > 0 {
+				m.scrollOffset = m.clampScrollOffset(m.scrollOffset - 1)
+			}
+		} else if m.messageCursor < len(displayMsgs)-1 {
+			// Move to next message
+			m.messageCursor++
+			// Auto-scroll to keep cursor visible
+			m.ensureCursorVisible()
+		} else if m.messageCursor == len(displayMsgs)-1 {
+			// At last message
+			if m.scrollOffset > 0 {
+				// If scrolled up, scroll down to show newer messages
+				m.scrollOffset = m.clampScrollOffset(m.scrollOffset - 1)
+			}
+			// If at newest message (scrollOffset == 0), stay on current message
+			// New messages are handled by real-time events
+		}
+		return m, nil, true
+
+	case "pgup":
+		displayMsgs := m.getDisplayMessages()
+		if len(displayMsgs) == 0 {
+			return m, nil, true
+		}
+
+		// Move by half page for smoother navigation
+		jumpSize := m.msgHeight() / messagePageJumpDiv
+		if jumpSize < messagePageJumpMin {
+			jumpSize = messagePageJumpMin
+		}
+
+		// If no cursor, start at last visible message
+		if m.messageCursor == -1 {
+			totalMsgs := len(displayMsgs)
+			end := totalMsgs - m.scrollOffset
+			if end > 0 {
+				m.messageCursor = end - 1
+			} else {
+				m.messageCursor = 0
+			}
+		}
+
+		// Move cursor up by jump size
+		m.messageCursor -= jumpSize
+		if m.messageCursor < 0 {
+			m.messageCursor = 0
+		}
+
+		// Ensure cursor visible
+		m.ensureCursorVisible()
+
+		// If near top, proactively fetch older messages
+		if m.messageCursor < messagePrefetchBuffer && len(m.messages) > 0 && m.current >= 0 && m.current < len(m.channels) {
+			log.Printf("pgup: fetching older messages (near top)")
+			oldestMsg := m.messages[0]
+			return m, fetchOlderMessages(m.platform, m.channels[m.current].ID, oldestMsg.ID), true
+		}
+		return m, nil, true
+
+	case "pgdown":
+		displayMsgs := m.getDisplayMessages()
+		if len(displayMsgs) == 0 {
+			return m, nil, true
+		}
+
+		// Move by half page for smoother navigation
+		jumpSize := m.msgHeight() / messagePageJumpDiv
+		if jumpSize < messagePageJumpMin {
+			jumpSize = messagePageJumpMin
+		}
+
+		// If no cursor, start at last visible message
+		if m.messageCursor == -1 {
+			totalMsgs := len(displayMsgs)
+			end := totalMsgs - m.scrollOffset
+			if end > 0 {
+				m.messageCursor = end - 1
+			} else {
+				m.messageCursor = 0
+			}
+		}
+
+		// Move cursor down by jump size
+		m.messageCursor += jumpSize
+		if m.messageCursor >= len(displayMsgs) {
+			m.messageCursor = len(displayMsgs) - 1
+		}
+
+		// Ensure cursor visible
+		m.ensureCursorVisible()
+		return m, nil, true
+
+	case "backspace", "ctrl+h":
+		// Backspace removes character in typing section
+		// Some terminals send "backspace", others send "ctrl+h"
+		if len(m.input) > 0 && m.cursorPos > 0 {
+			// Handle UTF-8 correctly by converting to runes
+			runes := []rune(m.input)
+			if m.cursorPos <= len(runes) {
+				m.input = string(runes[:m.cursorPos-1]) + string(runes[m.cursorPos:])
+				m.cursorPos--
+			}
+		}
+		return m, nil, true
+
+	case "ctrl+enter", "ctrl+m":
+		// Ctrl+Enter adds newline in typing section
+		runes := []rune(m.input)
+		m.input = string(runes[:m.cursorPos]) + "\n" + string(runes[m.cursorPos:])
+		m.cursorPos++
+		return m, nil, true
+
+	case " ":
+		// In main area, space is part of input
+		m.input += " "
+		m.cursorPos++
+		return m, nil, true
+	}
+	return m, nil, false
+}
+
+// handleInputChar handles regular character input in main area
+func (m model) handleInputChar(str string) (tea.Model, tea.Cmd, bool) {
+	if m.focus != focusMain {
+		return m, nil, false
+	}
+
+	// Ignore ctrl and alt combinations
+	if strings.HasPrefix(str, "ctrl+") || strings.HasPrefix(str, "alt+") {
+		return m, nil, false
+	}
+
+	// Only add single printable characters
+	if len(str) == 1 && str[0] >= printableCharMin && str[0] <= printableCharMax {
+		runes := []rune(m.input)
+		m.input = string(runes[:m.cursorPos]) + str + string(runes[m.cursorPos:])
+		m.cursorPos++
+		return m, nil, true
+	}
+	return m, nil, false
+}
+
 func fetchMessages(platform *comm.Platform, channelID string) tea.Cmd {
 	return func() tea.Msg {
-		messages, err := platform.GetMessages(channelID, 50)
+		log.Printf("fetchMessages: requesting initial messages for channel %s", channelID)
+		messages, err := platform.GetMessages(channelID, messageFetchLimit)
 		if err != nil {
+			log.Printf("fetchMessages: error: %v", err)
 			return errMsg(err)
 		}
+		log.Printf("fetchMessages: received %d messages", len(messages))
 		return messagesMsg(messages)
 	}
 }
 
 func fetchOlderMessages(platform *comm.Platform, channelID, beforeID string) tea.Cmd {
 	return func() tea.Msg {
-		messages, err := platform.GetMessagesBefore(channelID, beforeID, 20)
+		log.Printf("fetchOlderMessages: requesting messages before ID=%s", beforeID)
+		messages, err := platform.GetMessagesBefore(channelID, beforeID, messageFetchLimit)
 		if err != nil {
+			log.Printf("fetchOlderMessages: error: %v", err)
 			return errMsg(err)
 		}
+		log.Printf("fetchOlderMessages: received %d messages", len(messages))
 		return olderMessagesMsg(messages)
 	}
 }
@@ -542,18 +884,116 @@ func fetchMessage(platform *comm.Platform, messageID string) tea.Cmd {
 	}
 }
 
+// getDisplayMessages returns messages to display (filters thread replies)
+// Pike/Cox: cache filtered results to avoid repeated allocations
+func (m *model) getDisplayMessages() []comm.Message {
+	if !m.displayMsgsDirty {
+		return m.displayMsgsCache
+	}
+	// Filter thread replies in both channels and DMs
+	filtered := make([]comm.Message, 0, len(m.messages))
+	for _, msg := range m.messages {
+		if !isThreadReply(msg) {
+			filtered = append(filtered, msg)
+		}
+	}
+	m.displayMsgsCache = filtered
+	m.displayMsgsDirty = false
+	return filtered
+}
+
+// ensureCursorVisible adjusts scroll offset to keep message cursor visible
+func (m *model) ensureCursorVisible() {
+	if m.messageCursor == -1 {
+		// No cursor, reset to bottom
+		m.scrollOffset = 0
+		return
+	}
+
+	displayMsgs := m.getDisplayMessages()
+	if len(displayMsgs) == 0 {
+		return
+	}
+
+	msgHeight := m.msgHeight()
+	totalMsgs := len(displayMsgs)
+
+	// Calculate visible range using same logic as View()
+	// Work backward from end, counting screen lines
+	end := totalMsgs - m.scrollOffset
+	if end > totalMsgs {
+		end = totalMsgs
+	}
+	if end < 0 {
+		end = 0
+	}
+
+	linesUsed := 0
+	start := end
+	for start > 0 && linesUsed < msgHeight {
+		msgIdx := start - 1
+		msg := displayMsgs[msgIdx]
+		msgLines := len(strings.Split(msg.Text, "\n"))
+		if linesUsed+msgLines > msgHeight && linesUsed > 0 {
+			break
+		}
+		linesUsed += msgLines
+		start--
+	}
+
+	// If cursor is above visible area, scroll up to show it
+	if m.messageCursor < start {
+		m.scrollOffset = totalMsgs - m.messageCursor - 1
+	}
+
+	// If cursor is below visible area, scroll down to show it
+	if m.messageCursor >= end {
+		m.scrollOffset = totalMsgs - m.messageCursor - 1
+	}
+
+	// Clamp scroll offset
+	m.scrollOffset = m.clampScrollOffset(m.scrollOffset)
+}
+
 // msgHeight returns the height available for messages
-func (m *model) msgHeight() int {
+func (m model) msgHeight() int {
+	// Use actual terminal height, reserve 1 line for input
 	h := m.height - 1
-	if h < 3 {
-		h = 3
+	if h < minMessageHeight {
+		h = minMessageHeight
 	}
 	return h
 }
 
-// maxScroll returns the maximum scroll offset
-func (m *model) maxScroll() int {
-	max := len(m.messages) - m.msgHeight()
+// maxScroll returns the maximum scroll offset (in messages)
+func (m model) maxScroll() int {
+	displayMsgs := m.getDisplayMessages()
+	totalMsgs := len(displayMsgs)
+	if totalMsgs == 0 {
+		return 0
+	}
+
+	msgHeight := m.msgHeight()
+
+	// Work forward from start, counting lines to see how many messages fit
+	linesUsed := 0
+	msgsFit := 0
+	for i := 0; i < totalMsgs; i++ {
+		msg := displayMsgs[i]
+		msgLines := len(strings.Split(msg.Text, "\n"))
+		if linesUsed+msgLines > msgHeight && msgsFit > 0 {
+			// This message won't fit
+			break
+		}
+		linesUsed += msgLines
+		msgsFit++
+		if linesUsed >= msgHeight {
+			break
+		}
+	}
+
+	// maxScroll is how many messages we can skip from the end
+	max := totalMsgs - msgsFit
 	if max < 0 {
 		return 0
 	}
@@ -561,7 +1001,7 @@ func (m *model) maxScroll() int {
 }
 
 // clampScrollOffset ensures scroll offset is within valid bounds
-func (m *model) clampScrollOffset(offset int) int {
+func (m model) clampScrollOffset(offset int) int {
 	if offset < 0 {
 		return 0
 	}
@@ -572,38 +1012,12 @@ func (m *model) clampScrollOffset(offset int) int {
 	return offset
 }
 
-// scrollbarChar returns the character to display at given line in scrollbar
-func scrollbarChar(line, height, scrollOffset, totalMsgs int) string {
-	if totalMsgs <= height || height <= 0 {
-		return " " // No scroll needed
-	}
-
-	// Calculate thumb position as single character
-	maxScroll := totalMsgs - height
-	if maxScroll < 0 {
-		maxScroll = 0
-	}
-
-	// Calculate which line should have the thumb
-	var thumbLine int
-	if maxScroll > 0 {
-		// Invert: when scrollOffset=0 (bottom), thumb at bottom
-		// when scrollOffset=maxScroll (top), thumb at top
-		scrollRatio := float64(scrollOffset) / float64(maxScroll)
-		thumbLine = int((1.0 - scrollRatio) * float64(height-1))
-	} else {
-		thumbLine = height - 1 // At bottom
-	}
-
-	// Return appropriate character for this line
-	if line == thumbLine {
-		return "█" // Thumb (single block)
-	}
-	return "│" // Track
-}
-
 // getNavItems returns all navigable items in sidebar order
+// Pike/Cox: cache to avoid repeated allocations
 func (m *model) getNavItems() []navItem {
+	if !m.navItemsDirty {
+		return m.navItemsCache
+	}
 	var items []navItem
 
 	// Always add teams
@@ -630,6 +1044,8 @@ func (m *model) getNavItems() []navItem {
 		}
 	}
 
+	m.navItemsCache = items
+	m.navItemsDirty = false
 	return items
 }
 
@@ -687,55 +1103,51 @@ func (m *model) nick(userID string) string {
 		}
 	}
 	// Fallback
-	if len(userID) > 8 {
-		return userID[:8]
+	if len(userID) > userIDTruncateLen {
+		return userID[:userIDTruncateLen]
 	}
 	return userID
 }
 
-func (m model) View() string {
-	if !m.connected {
-		if m.err != nil {
-			return fmt.Sprintf("Error: %v\n\nPress Ctrl+C to quit.", m.err)
-		}
-		return "Connecting to Mattermost...\n"
+func isThreadReply(msg comm.Message) bool {
+	// Thread replies have non-empty root_id in metadata
+	if msg.Metadata == nil {
+		return false
 	}
-
-	// Default dimensions
-	width := m.width
-	if width == 0 {
-		width = 80
+	meta, ok := msg.Metadata.(map[string]interface{})
+	if !ok {
+		return false
 	}
-	height := m.height
-	if height == 0 {
-		height = 24
+	rootID, ok := meta["root_id"].(string)
+	return ok && rootID != ""
+}
+
+func (m model) isDMChannel() bool {
+	if len(m.channels) == 0 || m.current < 0 || m.current >= len(m.channels) {
+		return false
 	}
+	ch := m.channels[m.current]
+	return ch.Type == comm.ChannelTypeDirectMessage || ch.Type == comm.ChannelTypeGroupMessage
+}
 
-	// Layout: sidebar | messages | scrollbar
-	sidebarWidth := 20
-	if width < 50 {
-		sidebarWidth = 15
-	}
-	scrollbarWidth := 1
-	// Main width fills the space between sidebar and scrollbar
-	mainWidth := width - sidebarWidth - scrollbarWidth - 1 // -1 for separator
+// Pike/Cox: extract rendering functions from View to reduce function size
+// renderSidebar renders the teams, channels, and DMs sidebar
+func (m model) renderSidebar(sidebar int) string {
+	var b strings.Builder
 
-	var left, right strings.Builder
-
-	// LEFT: Teams, Channels, and DMs list
 	// Teams section
 	teamHeader := "=Teams="
 	if m.focus == focusSidebar {
 		teamHeader = "[Teams]"
 	}
-	left.WriteString(teamHeader + "\n")
+	b.WriteString(teamHeader + "\n")
 	for i, team := range m.teams {
 		name := team.DisplayName
 		if name == "" {
 			name = team.Name
 		}
-		if len(name) > sidebarWidth-3 {
-			name = name[:sidebarWidth-4] + "~"
+		if len(name) > sidebar-3 {
+			name = name[:sidebar-4] + "~"
 		}
 		// Marker: * for cursor, > for active team
 		marker := " "
@@ -746,37 +1158,36 @@ func (m model) View() string {
 			// This is the active team
 			marker = ">"
 			baseText = fmt.Sprintf("%s%s", marker, name)
-			if len(baseText) < sidebarWidth {
-				baseText += strings.Repeat(" ", sidebarWidth-len(baseText))
+			if len(baseText) < sidebar {
+				baseText += strings.Repeat(" ", sidebar-len(baseText))
 			}
-			left.WriteString(currentStyle.Render(baseText) + "\n")
+			b.WriteString(style.current.Render(baseText) + "\n")
 		} else if m.isItemSelected(navTeam, i) {
 			// Cursor is on this team
 			marker = "*"
 			baseText = fmt.Sprintf("%s%s", marker, name)
-			if len(baseText) < sidebarWidth {
-				baseText += strings.Repeat(" ", sidebarWidth-len(baseText))
+			if len(baseText) < sidebar {
+				baseText += strings.Repeat(" ", sidebar-len(baseText))
 			}
-			left.WriteString(selectedStyle.Render(baseText) + "\n")
+			b.WriteString(style.selected.Render(baseText) + "\n")
 		} else {
-			if len(baseText) < sidebarWidth {
-				baseText += strings.Repeat(" ", sidebarWidth-len(baseText))
+			if len(baseText) < sidebar {
+				baseText += strings.Repeat(" ", sidebar-len(baseText))
 			}
-			left.WriteString(baseText + "\n")
+			b.WriteString(baseText + "\n")
 		}
 	}
-	left.WriteString("\n")
+	b.WriteString("\n")
 
 	// Channels section
 	header := "=Channels="
 	if m.focus == focusSidebar {
 		header = "[Channels]"
 	}
-	left.WriteString(header + "\n")
+	b.WriteString(header + "\n")
 
 	if m.teamSelected {
 		chCount := 0
-		// Channels are already filtered by team from GetChannels() - no need to filter again
 		for i, ch := range m.channels {
 			if ch.Type == comm.ChannelTypeDirectMessage || ch.Type == comm.ChannelTypeGroupMessage {
 				continue
@@ -785,8 +1196,8 @@ func (m model) View() string {
 			if name == "" {
 				name = ch.Name
 			}
-			if len(name) > sidebarWidth-3 {
-				name = name[:sidebarWidth-4] + "~"
+			if len(name) > sidebar-3 {
+				name = name[:sidebar-4] + "~"
 			}
 			// Marker: * for cursor, > for current active channel
 			marker := " "
@@ -794,25 +1205,25 @@ func (m model) View() string {
 			if i == m.current {
 				marker = ">"
 				baseText = fmt.Sprintf("%s%d:%s", marker, chCount+1, name)
-				if len(baseText) < sidebarWidth {
-					baseText += strings.Repeat(" ", sidebarWidth-len(baseText))
+				if len(baseText) < sidebar {
+					baseText += strings.Repeat(" ", sidebar-len(baseText))
 				}
-				left.WriteString(currentStyle.Render(baseText) + "\n")
+				b.WriteString(style.current.Render(baseText) + "\n")
 			} else if m.isItemSelected(navChannel, i) {
 				marker = "*"
 				baseText = fmt.Sprintf("%s%d:%s", marker, chCount+1, name)
-				if len(baseText) < sidebarWidth {
-					baseText += strings.Repeat(" ", sidebarWidth-len(baseText))
+				if len(baseText) < sidebar {
+					baseText += strings.Repeat(" ", sidebar-len(baseText))
 				}
-				left.WriteString(selectedStyle.Render(baseText) + "\n")
+				b.WriteString(style.selected.Render(baseText) + "\n")
 			} else {
-				if len(baseText) < sidebarWidth {
-					baseText += strings.Repeat(" ", sidebarWidth-len(baseText))
+				if len(baseText) < sidebar {
+					baseText += strings.Repeat(" ", sidebar-len(baseText))
 				}
-				left.WriteString(baseText + "\n")
+				b.WriteString(baseText + "\n")
 			}
 			chCount++
-			if chCount >= 9 {
+			if chCount >= maxChannelsDisplay {
 				break
 			}
 		}
@@ -823,7 +1234,7 @@ func (m model) View() string {
 	if m.focus == focusSidebar {
 		dmHeader = "\n[DMs]"
 	}
-	left.WriteString(dmHeader + "\n")
+	b.WriteString(dmHeader + "\n")
 
 	if m.teamSelected {
 		dmCount := 0
@@ -832,8 +1243,8 @@ func (m model) View() string {
 				continue
 			}
 			name := ch.DisplayName
-			if len(name) > sidebarWidth-3 {
-				name = name[:sidebarWidth-4] + "~"
+			if len(name) > sidebar-3 {
+				name = name[:sidebar-4] + "~"
 			}
 			// Marker: * for cursor, > for current active DM
 			marker := " "
@@ -841,139 +1252,206 @@ func (m model) View() string {
 			if i == m.current {
 				marker = ">"
 				baseText = fmt.Sprintf("%s%s", marker, name)
-				if len(baseText) < sidebarWidth {
-					baseText += strings.Repeat(" ", sidebarWidth-len(baseText))
+				if len(baseText) < sidebar {
+					baseText += strings.Repeat(" ", sidebar-len(baseText))
 				}
-				left.WriteString(currentStyle.Render(baseText) + "\n")
+				b.WriteString(style.current.Render(baseText) + "\n")
 			} else if m.isItemSelected(navDM, i) {
 				marker = "*"
 				baseText = fmt.Sprintf("%s%s", marker, name)
-				if len(baseText) < sidebarWidth {
-					baseText += strings.Repeat(" ", sidebarWidth-len(baseText))
+				if len(baseText) < sidebar {
+					baseText += strings.Repeat(" ", sidebar-len(baseText))
 				}
-				left.WriteString(selectedStyle.Render(baseText) + "\n")
+				b.WriteString(style.selected.Render(baseText) + "\n")
 			} else {
-				if len(baseText) < sidebarWidth {
-					baseText += strings.Repeat(" ", sidebarWidth-len(baseText))
+				if len(baseText) < sidebar {
+					baseText += strings.Repeat(" ", sidebar-len(baseText))
 				}
-				left.WriteString(baseText + "\n")
+				b.WriteString(baseText + "\n")
 			}
 			dmCount++
-			if dmCount >= 5 {
+			if dmCount >= maxDMsDisplay {
 				break
 			}
 		}
 	}
 
-	// RIGHT: Messages + Input
-	// Get channel name for input line
-	channel := ""
-	if len(m.channels) > 0 && m.current >= 0 && m.current < len(m.channels) {
-		ch := m.channels[m.current]
-		name := ch.DisplayName
-		if name == "" {
-			name = ch.Name
-		}
-		channel = name
-	}
+	return b.String()
+}
 
-	// Messages with scroll support
-	// Reserve space for input line (messages + input)
-	msgHeight := height - 1
-	if msgHeight < 3 {
-		msgHeight = 3
-	}
+// renderMessages renders the message area with proper scrolling
+func (m model) renderMessages(mainWidth, msgHeight int) string {
+	var b strings.Builder
 
-	// scrollOffset=0 means bottom (latest), >0 means scrolled up
-	totalMsgs := len(m.messages)
+	displayMsgs := m.getDisplayMessages()
+	totalMsgs := len(displayMsgs)
 	end := totalMsgs - m.scrollOffset
-	start := end - msgHeight
-	if start < 0 {
-		start = 0
-	}
 	if end > totalMsgs {
 		end = totalMsgs
 	}
+	if end < 0 {
+		end = 0
+	}
 
-	displayCount := 0
+	// Work backward from 'end', counting screen lines used
+	linesUsed := 0
+	start := end
+	for start > 0 && linesUsed < msgHeight {
+		msgIdx := start - 1
+		msg := displayMsgs[msgIdx]
+		msgLines := len(strings.Split(msg.Text, "\n"))
+		if linesUsed+msgLines > msgHeight && linesUsed > 0 {
+			// This message won't fit, stop here
+			break
+		}
+		linesUsed += msgLines
+		start--
+	}
+
+	// Fill empty lines at top (for bottom alignment)
+	for i := 0; i < msgHeight-linesUsed; i++ {
+		b.WriteString("\n")
+	}
+
+	// Render messages at bottom with multi-line support
 	for i := start; i < end; i++ {
-		msg := m.messages[i]
+		msg := displayMsgs[i]
 		t := msg.CreatedAt.Format("15:04")
 		nick := m.nick(msg.SenderID)
 		text := msg.Text
 
-		line := fmt.Sprintf("%s %s %s",
-			timeStyle.Render(t),
-			nickStyle.Render(fmt.Sprintf("<%s>", nick)),
-			text)
+		// Handle multi-line messages
+		lines := strings.Split(text, "\n")
+		isHighlighted := i == m.messageCursor
 
-		if len(line) > mainWidth {
-			line = line[:mainWidth-3] + "..."
+		for lineIdx, textLine := range lines {
+			var line string
+			if lineIdx == 0 {
+				// First line: show time and nick
+				timeStr := t
+				nickStr := fmt.Sprintf("<%s>", nick)
+				prefixWidth := len(timeStr) + 1 + len(nickStr) + 1 // "HH:MM <nick> "
+				availableWidth := mainWidth - prefixWidth
+				if availableWidth < 0 {
+					availableWidth = 0
+				}
+
+				// Truncate text if needed, add ellipsis
+				if len(textLine) > availableWidth {
+					if availableWidth > minTruncateWidth {
+						textLine = textLine[:availableWidth-ellipsisLen] + "..."
+					} else if availableWidth > 0 {
+						textLine = textLine[:availableWidth]
+					} else {
+						textLine = ""
+					}
+				}
+
+				if isHighlighted {
+					// Use highlighted style for all parts
+					line = fmt.Sprintf("%s %s %s",
+						style.highlighted.Render(timeStr),
+						style.highlighted.Render(nickStr),
+						style.highlighted.Render(textLine))
+				} else {
+					// Use normal styles
+					line = fmt.Sprintf("%s %s %s",
+						style.time.Render(timeStr),
+						style.nick.Render(nickStr),
+						textLine)
+				}
+			} else {
+				// Continuation lines: indent
+				nickWidth := len(nick) + nickPrefixLen + nickSuffixLen
+				indent := strings.Repeat(" ", timeWidth+1+nickWidth)
+				availableWidth := mainWidth - len(indent)
+				if availableWidth < 0 {
+					availableWidth = 0
+				}
+
+				// Truncate text if needed, add ellipsis
+				if len(textLine) > availableWidth {
+					if availableWidth > minTruncateWidth {
+						textLine = textLine[:availableWidth-ellipsisLen] + "..."
+					} else if availableWidth > 0 {
+						textLine = textLine[:availableWidth]
+					} else {
+						textLine = ""
+					}
+				}
+
+				if isHighlighted {
+					line = style.highlighted.Render(indent + textLine)
+				} else {
+					line = indent + textLine
+				}
+			}
+
+			b.WriteString(line)
+			b.WriteString("\n")
 		}
-		right.WriteString(line)
-		right.WriteString("\n")
-		displayCount++
 	}
 
-	// Fill empty lines
-	for i := displayCount; i < msgHeight; i++ {
-		right.WriteString("\n")
+	return b.String()
+}
+
+// renderInput renders the input line with cursor
+func (m model) renderInput(mainWidth int, channel string) string {
+	displayInput := strings.ReplaceAll(m.input, "\n", "↵")
+	runes := []rune(displayInput)
+	var inputWithCursor string
+	cursorChar := " "
+	if m.focus == focusMain && m.cursorVisible {
+		cursorChar = "█"
+	} else if m.focus == focusMain {
+		cursorChar = " "
+	} else {
+		cursorChar = "█"
 	}
+	if m.cursorPos >= len(runes) {
+		inputWithCursor = displayInput + cursorChar
+	} else {
+		inputWithCursor = string(runes[:m.cursorPos]) + cursorChar + string(runes[m.cursorPos:])
+	}
+	inputLine := fmt.Sprintf("[%s] %s", channel, inputWithCursor)
+	if len(inputLine) > mainWidth {
+		inputLine = inputLine[:mainWidth]
+	}
+	return style.input.Render(inputLine)
+}
 
-	// Note: Input will be rendered directly in the combining loop
-	// to ensure it's always at the bottom line
-
-	// Combine left and right
-	leftLines := strings.Split(left.String(), "\n")
-	rightLines := strings.Split(right.String(), "\n")
+// combinePanes combines left sidebar and right message area
+func (m model) combinePanes(leftStr, rightStr string, sidebar, mainWidth, height int) string {
+	leftLines := strings.Split(leftStr, "\n")
+	rightLines := strings.Split(rightStr, "\n")
 
 	var b strings.Builder
 	for i := 0; i < height; i++ {
-		// Left side - always pad to exact sidebarWidth
+		// Left side - always pad to exact sidebar width
 		if i < len(leftLines) {
 			line := leftLines[i]
 			visibleLen := lipgloss.Width(line)
-			if visibleLen < sidebarWidth {
+			if visibleLen < sidebar {
 				b.WriteString(line)
-				b.WriteString(strings.Repeat(" ", sidebarWidth-visibleLen))
-			} else if visibleLen > sidebarWidth {
+				b.WriteString(strings.Repeat(" ", sidebar-visibleLen))
+			} else if visibleLen > sidebar {
 				// Truncate if too long
-				b.WriteString(line[:sidebarWidth])
+				b.WriteString(line[:sidebar])
 			} else {
 				b.WriteString(line)
 			}
 		} else {
-			b.WriteString(strings.Repeat(" ", sidebarWidth))
+			b.WriteString(strings.Repeat(" ", sidebar))
 		}
 
 		b.WriteString("|")
 
-		// Right side - messages fill to mainWidth, then scrollbar at far right
+		// Right side - messages fill to mainWidth
 		var msgLine string
 		if i == height-1 {
-			// Always render input at bottom (last line)
-			displayInput := strings.ReplaceAll(m.input, "\n", "↵")
-			runes := []rune(displayInput)
-			var inputWithCursor string
-			cursorChar := " "
-			if m.focus == focusMain && m.cursorVisible {
-				cursorChar = "█"
-			} else if m.focus == focusMain {
-				cursorChar = " "
-			} else {
-				cursorChar = "█"
-			}
-			if m.cursorPos >= len(runes) {
-				inputWithCursor = displayInput + cursorChar
-			} else {
-				inputWithCursor = string(runes[:m.cursorPos]) + cursorChar + string(runes[m.cursorPos:])
-			}
-			inputLine := fmt.Sprintf("[%s] %s", channel, inputWithCursor)
-			if len(inputLine) > mainWidth {
-				inputLine = inputLine[:mainWidth]
-			}
-			msgLine = inputStyle.Render(inputLine)
-		} else if i < len(rightLines) {
+			// Input line is passed separately
+			msgLine = rightLines[len(rightLines)-1] // Last line is input
+		} else if i < len(rightLines)-1 {
 			msgLine = rightLines[i]
 		} else {
 			msgLine = ""
@@ -986,19 +1464,64 @@ func (m model) View() string {
 			b.WriteString(strings.Repeat(" ", mainWidth-visibleLen))
 		}
 
-		// Add scrollbar at far right - always 1 char
-		if i == height-1 {
-			b.WriteString(" ")
-		} else {
-			b.WriteString(scrollbarChar(i, msgHeight, m.scrollOffset, len(m.messages)))
-		}
-
 		if i < height-1 {
 			b.WriteString("\n")
 		}
 	}
 
 	return b.String()
+}
+
+func (m model) View() string {
+	// Pike/Cox: simplified View function using extracted rendering methods
+	if !m.connected {
+		if m.err != nil {
+			return fmt.Sprintf("Error: %v\n\nPress Ctrl+C to quit.", m.err)
+		}
+		return "Connecting to Mattermost...\n"
+	}
+
+	// Calculate dimensions
+	width := m.width
+	if width == 0 {
+		width = defaultWidth
+	}
+	height := m.height
+	if height == 0 {
+		height = defaultHeight
+	}
+
+	// Layout: sidebar | messages
+	sidebar := sidebarWidth
+	if width < minWidthForFullSide {
+		sidebar = sidebarWidthSmall
+	}
+	mainWidth := width - sidebar - 1 // -1 for separator
+	if mainWidth < minMainWidth {
+		mainWidth = minMainWidth
+	}
+
+	// Get channel name for input line
+	channel := ""
+	if len(m.channels) > 0 && m.current >= 0 && m.current < len(m.channels) {
+		ch := m.channels[m.current]
+		name := ch.DisplayName
+		if name == "" {
+			name = ch.Name
+		}
+		channel = name
+	}
+
+	// Render components
+	leftPane := m.renderSidebar(sidebar)
+	messagesPane := m.renderMessages(mainWidth, m.msgHeight())
+	inputLine := m.renderInput(mainWidth, channel)
+
+	// Combine messages and input into right pane
+	rightPane := messagesPane + inputLine
+
+	// Combine left and right panes
+	return m.combinePanes(leftPane, rightPane, sidebar, mainWidth, height)
 }
 
 func main() {
@@ -1008,6 +1531,7 @@ func main() {
 	user := flag.String("user", "", "Username or email for login")
 	pass := flag.String("pass", "", "Password for login")
 	teamID := flag.String("teamid", "", "Team ID (optional)")
+	debug := flag.Bool("debug", false, "Enable debug logging to termunicator_debug.log")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "termunicator - irssi-style TUI for Mattermost\n\n")
@@ -1030,6 +1554,22 @@ func main() {
 	}
 
 	flag.Parse()
+
+	// Setup debug logging if requested
+	if *debug {
+		logFile, err := os.OpenFile("termunicator_debug.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err == nil {
+			log.SetOutput(logFile)
+			defer logFile.Close()
+			log.Printf("=== termunicator started (debug mode) ===")
+		} else {
+			fmt.Fprintf(os.Stderr, "Warning: Could not open debug log file: %v\n", err)
+			log.SetOutput(io.Discard)
+		}
+	} else {
+		// Disable logging by default
+		log.SetOutput(io.Discard)
+	}
 
 	// Validate required flags
 	if *host == "" {
@@ -1057,4 +1597,11 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
